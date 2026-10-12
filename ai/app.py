@@ -8,15 +8,28 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
+import base64
+import binascii
 import os
 
 app = FastAPI(title="SANSKRITI AI Culture Lens", version="1.0.0")
 
+# Configure browser origins through ALLOWED_ORIGINS (comma-separated).
+# Local development defaults are included; production should set its own origins.
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost:3000,http://localhost:5173",
+    ).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
@@ -110,7 +123,11 @@ def heuristic(query: str):
     for item in KNOWLEDGE:
         score = sum(1 for k in item["keys"] if k in q)
         if score > 0:
-            related = [k["id"] for k in KNOWLEDGE if k != item and score >= 0]
+            related = [
+                other["id"]
+                for other in KNOWLEDGE
+                if other != item and any(key in q for key in other["keys"])
+            ]
             return {
                 "possible_identification": item["id"],
                 "art_form": item["art_form"],
@@ -132,19 +149,57 @@ def heuristic(query: str):
         "related": [],
     }
 
-def gemini(query: str):
+def decode_image(image_b64: str):
+    """Decode a base64 image or data URL into Gemini's expected image payload."""
+    if not image_b64:
+        return None
+
+    mime_type = "image/jpeg"
+    encoded = image_b64.strip()
+    if encoded.startswith("data:"):
+        header, separator, encoded = encoded.partition(",")
+        if not separator:
+            raise ValueError("Invalid image data URL.")
+        mime_type = header[5:].split(";", 1)[0] or mime_type
+
+    if mime_type not in {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}:
+        raise ValueError("Unsupported image type. Use JPEG, PNG, WebP, HEIC, or HEIF.")
+
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Image must be valid base64 data.") from exc
+
+    if not image_bytes:
+        raise ValueError("Image data is empty.")
+    if len(image_bytes) > 10 * 1024 * 1024:
+        raise ValueError("Image must be 10 MB or smaller.")
+
+    return {"mime_type": mime_type, "data": image_bytes}
+
+
+def gemini(query: str, image_b64: Optional[str] = None):
     import google.generativeai as genai
+
     genai.configure(api_key=GEMINI_KEY)
     model = genai.GenerativeModel("gemini-1.5-flash")
     prompt = (
-        "You are an expert on Indian cultural heritage. Analyze the following "
-        "description of a cultural object/artefact and return JSON with keys: "
-        "possible_identification, art_form, region, period, history, "
-        "cultural_significance, related_traditions (array). Description: "
-        + query +
-        "\nReturn only valid JSON."
+        "You are an expert on Indian cultural heritage. Analyze the supplied "
+        "description and/or image of a cultural object or artefact. Return JSON "
+        "with keys: possible_identification, art_form, region, period, history, "
+        "significance, and related (array). State uncertainty when evidence is "
+        "insufficient. Description: "
+        + (query or "No text description provided.")
+        + "\nReturn only valid JSON."
     )
-    resp = model.generate_content(prompt)
+    image_payload = decode_image(image_b64) if image_b64 else None
+    response_parts = [prompt]
+    if image_payload:
+        response_parts.append(image_payload)
+
+    resp = model.generate_content(response_parts)
+    if not getattr(resp, "text", None):
+        raise ValueError("The AI service returned an empty response.")
     return resp.text
 
 @app.get("/health")
@@ -153,20 +208,55 @@ def health():
 
 @app.post("/identify")
 def identify(req: IdentifyRequest):
-    query = req.query or req.image_b64 or ""
+    query = (req.query or "").strip()
+    if not query and not req.image_b64:
+        return {"analysis": heuristic(""), "source": "heuristic"}
+
     if GEMINI_KEY:
         try:
-            text = gemini(query)
-            return {"analysis": text, "source": "gemini"}
-        except Exception as e:
-            return {"analysis": heuristic(query), "source": "gemini-fallback", "error": str(e)}
-    return {"analysis": heuristic(query), "source": "heuristic"}
+            result = gemini(query, req.image_b64)
+            return {"analysis": result, "source": "gemini"}
+        except (ValueError, binascii.Error) as exc:
+            return {"analysis": heuristic(query), "source": "heuristic-fallback", "message": str(exc)}
+        except Exception:
+            # Avoid returning provider details or configuration data to clients.
+            return {"analysis": heuristic(query), "source": "gemini-fallback"}
+
+    # Without Gemini, image bytes cannot be identified; use text only when supplied.
+    if query:
+        return {"analysis": heuristic(query), "source": "heuristic"}
+    return {
+        "analysis": {
+            "possible_identification": "Image analysis unavailable",
+            "art_form": "Unknown",
+            "region": "Unknown",
+            "period": "Unknown",
+            "history": "Configure GEMINI_API_KEY to enable image analysis.",
+            "significance": "Not available.",
+            "confidence": 0,
+            "related": [],
+        },
+        "source": "heuristic",
+    }
+
 
 @app.post("/describe")
 def describe(req: DescribeRequest):
-    query = req.query or req.image_b64 or ""
-    a = heuristic(query)
-    return {"summary": a["history"], "traditions": [], "source": "heuristic"}
+    query = (req.query or "").strip()
+    if not query and not req.image_b64:
+        return {"summary": "Provide a text description or image to analyze.", "traditions": [], "source": "heuristic"}
+
+    if GEMINI_KEY:
+        try:
+            result = gemini(query, req.image_b64)
+            return {"summary": result, "traditions": [], "source": "gemini"}
+        except (ValueError, binascii.Error) as exc:
+            return {"summary": str(exc), "traditions": [], "source": "heuristic-fallback"}
+        except Exception:
+            return {"summary": heuristic(query)["history"], "traditions": [], "source": "gemini-fallback"}
+
+    result = heuristic(query)
+    return {"summary": result["history"], "traditions": result["related"], "source": "heuristic"}
 
 if __name__ == "__main__":
     import uvicorn
