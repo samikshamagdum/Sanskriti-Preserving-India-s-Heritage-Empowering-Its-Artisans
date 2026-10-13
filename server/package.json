@@ -1,0 +1,27 @@
+{
+  "name": "sanskriti-server",
+  "version": "1.0.0",
+  "description": "SANSKRITI - Cultural heritage platform backend",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js",
+    "create-admin": "node src/scripts/create-admin.js",
+    "lint": "echo no lint && exit 0",
+    "test": "echo no tests && exit 0",
+    "build": "echo no build && exit 0"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.11.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.6.0",
+    "multer": "^1.4.5-lts.1"
+  }
+}
